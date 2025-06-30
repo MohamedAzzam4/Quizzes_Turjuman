@@ -1,163 +1,73 @@
-# main.py
-
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, ValidationError
-from typing import List, Optional
+from pydantic import BaseModel, Field
+from typing import List
 import os
 from dotenv import load_dotenv
+from langchain_google_genai import ChatGoogleGenerativeAI
 import json_repair
-from langchain_google_genai import ChatGoogleGenerativeAI # استخدام المكتبة الصحيحة لـ Gemini مع Langchain
-import json # لإضافة الـ schema في الـ prompt
-import uvicorn
-
-# --- Pydantic Models ---
-
-# نموذج لمدخلات الـ API
-class TranslationInput(BaseModel):
-    source_language: str = Field(
-        ...,
-        min_length=1,
-        max_length=100,
-        description="The source language needed to be translated from."
-    )
-    
-    target_language: str = Field(
-        ...,
-        min_length=1,
-        max_length=100,
-        description="The Targeted language needed to be translated to."
-    )
-    
-    word: str = Field(
-        ...,
-        min_length=1,
-        max_length=100,
-        description="The word to translate."
-    )
-    
-    context : Optional[str] = Field(
-        None,
-        min_length=0,
-        max_length=1000,
-        description="The context paragraph where the word appears., it may contains no context just a simple word need to be transalted"
-    )
+from fastapi.middleware.cors import CORSMiddleware
 
 
-# نموذج لمخرجات الـ API (نفس النموذج اللي عرفته)
-class Translation(BaseModel):
-    translation: str = Field(
-        ...,
-        min_length=1, # يمكن تكون كلمة واحدة
-        max_length=255,
-        description="The translated word in the target language (Arabic), based on the provided context."
-    )
-    target_synonyms: List[str] = Field(
-        ...,
-        min_items=0, # ممكن تكون القائمة فاضية لو النموذج معرفش يجيب مرادفات
-        max_items=5,
-        description="Different synonymous words in Arabic, relevant to the context. No duplicates."
-    )
-    source_synonyms: List[str] = Field(
-        ...,
-        min_items=0, # ممكن تكون القائمة فاضية
-        max_items=5,
-        description="Synonyms of the word in English. No duplicates."
-    )
-    definition: str = Field(
-        ...,
-        min_length=5,
-        max_length=500, # زودت الحد الأقصى للتعريف شوية
-        description="Definition of the original word in English."
-    )
-    example_usage: str = Field(
-        ...,
-        min_length=5,
-        max_length=500, # زودت الحد الأقصى للمثال شوية
-        description="An example sentence or phrase using the word to demonstrate its usage in context in English."
-    )
-
-
-# --- Helper Functions ---
-
-def parse_json(text):
-    """Attempts to parse text as JSON, using json_repair as a fallback."""
-    try:
-        # First, try standard JSON parsing (more strict)
-        return json.loads(text)
-    except (json.JSONDecodeError, TypeError):
-        # If standard parsing fails, try json_repair
-        try:
-            return json_repair.loads(text)
-        except Exception as e:
-            print(f"json_repair failed: {e}") # طباعة الخطأ للمساعدة في Debug
-            return None
-
-def build_translation_messages(word: str, source_language: str, target_language: str, context: Optional[str] = None) -> List[dict]:
-    """Builds the message list for the Gemini API call."""
-    # استخدام model_json_schema() في Pydantic V2 للحصول على الـ schema
-    schema_json_string = json.dumps(Translation.model_json_schema(), ensure_ascii=False, indent=2)
-    user_message = f"source_language: {target_language.strip()}, target_Language: {target_language.strip()} , Word: {word.strip()}"
-    if context:
-        user_message = f"Context: {context.strip()}\n" + user_message
-
-    messages = [
-        {
-            "role": "system",
-            "content": "\n".join([
-                f"You are a professional translator from {source_language} to {target_language}.",
-                f"You will be provided with a word in {source_language} and its context is optional.",
-                "Translate the word based on the context.",
-                "Provide:",
-                f"- The translated word in {target_language} as the user will specify.",
-                f"- A list of up to 5 relevant synonyms in {target_language}.",
-                f"- A list of up to 5 relevant synonyms in {source_language}.",
-                f"- The definition of the original word in {target_language}.",
-                f"- An example sentence using the original word in {target_language}.",
-                "Your output must be a valid JSON object exactly matching the following Pydantic schema:",
-                f"```json\n{schema_json_string}\n```", # تضمين الـ schema في الـ prompt
-                "Do not add any extra text before or after the JSON.",
-            ])
-        },
-        {
-            "role": "user",
-            "content": user_message
-        }
-    ]
-    return messages
-
-# --- Environment Setup & Model Initialization ---
-
-# تحميل متغيرات البيئة من ملف .env (لو موجود)
+# تحميل متغيرات البيئة
 load_dotenv()
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-# الحصول على مفتاح API من متغير البيئة
-# استخدم نفس الاسم اللي استخدمته في الـ script الأول
-gemini_api_key = os.getenv("GEMINI_API_KEY")
+# إعداد FastAPI
+app = FastAPI()
 
-if not gemini_api_key:
-    # لو المفتاح مش موجود في متغيرات البيئة، ارفع خطأ
-    # Railway هيتعرف على هذا الخطأ وهيفهم أن فيه مشكلة في التهيئة
-    print("Error: GEMINI_API_KEY environment variable is not set.")
-    print("Please set the GEMINI_API_KEY environment variable in your Railway project settings.")
-    # يمكن استخدام sys.exit(1) هنا لو عايز التطبيق يفشل بسرعة لو المتغير مش موجود
-    # لكن رفع Exception هو الطريقة القياسية في تهيئة التطبيقات
-    raise ValueError("GEMINI_API_KEY environment variable is missing.")
+# إعداد موديل Gemini
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=GOOGLE_API_KEY)
 
-# تهيئة نموذج Gemini (هتتم مرة واحدة عند بدء تشغيل التطبيق)
-try:
-    gemini_model = ChatGoogleGenerativeAI(
-        model="models/gemini-1.5-flash",
-        temperature=0.5,
-        google_api_key=gemini_api_key # استخدام المفتاح من متغير البيئة
-    )
-    print("Gemini model initialized successfully.")
-except Exception as e:
-    print(f"Error initializing Gemini model: {e}")
-    # لو فشلت التهيئة هنا، التطبيق مش هيشتغل
-    raise
+# نموذج الإدخال
+class QuizRequest(BaseModel):
+    srcLang: str = Field(..., description="The language in which questions should be generated.")
+    words: List[str] = Field(..., min_items=5, max_items=5, description="List of 5 words.")
 
-# --- FastAPI App Setup ---
+# بناء البرومبت
+def build_prompt(words: List[str], language: str) -> str:
+    word_list = ', '.join(f'"{w}"' for w in words)
+    return f"""
+You will receive 5 words. Your task is to generate 10 multiple-choice quiz questions (2 per word).
+
+All output must be written in **{language}**.
+
+Use a variety of question types, such as:
+- Definition of the word.
+- Synonym or alternative in the same language.
+- Translation of the word.
+- Contextual usage.
+- Part of speech.
+
+Each question must follow this JSON format:
+[
+  {{
+    "question": "1. Your question here",
+    "options": [
+      "A. Option one",
+      "B. Option two",
+      "C. Option three",
+      "D. Option four"
+    ],
+    "correct_answer": "2"
+  }},
+  ...
+]
+
+Rules:
+- Return exactly 10 questions.
+- All questions must relate to the following words: {word_list}
+- All options must be plausible and only one correct.
+- Only return a clean valid JSON array. No explanation or extra text.
+
+Words: {word_list}
+"""
+
+# محاولة تصحيح وتحويل النص إلى JSON
+def parse_json(text):
+    try:
+        return json_repair.loads(text)
+    except:
+        return None
 
 app = FastAPI()
 
@@ -174,71 +84,24 @@ app.add_middleware(
 )
 
 
-# --- FastAPI Endpoints ---
 
-@app.get("/")
-async def read_root():
-    """Root endpoint returning basic API info."""
-    return {"message": "Welcome ;) Translator API For Turjuman is running.", "version": "1.0.0"}
+# نقطة النهاية للـ API
+@app.post("/generate-questions/")
+async def generate_questions(request: QuizRequest):
+    if len(request.words) != 5:
+        raise HTTPException(status_code=400, detail="Exactly 5 words are required.")
 
-@app.post("/translate", response_model=Translation)
-async def translate_word_endpoint(input_data: TranslationInput):
-    """
-    Translates an English word to Arabic based on context using the Turjuman Model.
-
-    Expects a JSON body with 'word' and 'context'.
-    Returns a JSON object with translation details, synonyms, definition, and example usage.
-    """
-    messages = build_translation_messages(input_data.word, input_data.source_language, input_data.target_language, input_data.context)
+    prompt = build_prompt(request.words, request.srcLang)
 
     try:
-        # استدعاء نموذج Gemini
-        gemini_response = gemini_model.invoke(messages)
+        response = llm.invoke(prompt)
+        response_text = response.content
+        questions = parse_json(response_text)
 
-        # الحصول على محتوى الرد وتنظيفه من المسافات البيضاء الزائدة
-        raw_json_string = gemini_response.content.strip()
+        if not questions:
+            raise HTTPException(status_code=500, detail="Failed to parse Gemini response as JSON.")
 
-        # محاولة تحليل JSON (مع إصلاح الأخطاء المحتملة)
-        parsed_data = parse_json(raw_json_string)
+        return questions
 
-        # التحقق مما إذا كان التحليل ناجحًا
-        if parsed_data is None:
-            print(f"Failed to parse or repair JSON for input: word='{input_data.word}', context='{input_data.context[:50]}...'")
-            print(f"Raw response content: {raw_json_string}") # اطبع الرد الخام للمراجعة
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to parse or repair JSON response from the language model."
-            )
-
-        # التحقق من صحة البيانات المحللة باستخدام نموذج Pydantic
-        # هذا سيضمن أن البيانات تتطابق مع الهيكل المتوقع وأنواع البيانات
-        validated_data = Translation(**parsed_data)
-
-        # إرجاع البيانات الصحيحة
-        return validated_data
-
-    except ValidationError as e:
-        # Catch Pydantic validation errors if the parsed JSON doesn't match the model
-        print(f"Pydantic validation error: {e.errors()}")
-        print(f"Problematic JSON data: {parsed_data}") # اطبع البيانات اللي سببت الخطأ
-        raise HTTPException(
-            status_code=500,
-            detail=f"Language model returned data that doesn't match the expected structure: {e.errors()}"
-        )
     except Exception as e:
-        # Catch any other unexpected errors
-        print(f"An unexpected error occurred: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"An internal error occurred during translation: {e}"
-        )
-if __name__ == "__main__":
-    # حاول تقرأ البورت من متغير البيئة PORT، لو مش موجود استخدم 8080
-    port = int(os.environ.get("PORT", 8080))
-    # شغل السيرفر باستخدام uvicorn
-    # host="0.0.0.0" مهم جداً عشان Railway يقدر يوصل للتطبيق
-    uvicorn.run(app, host="0.0.0.0", port=port)
-# --- نهاية الجزء المضاف ---
-# ملاحظة: للتشغيل المحلي، ستحتاج إلى تثبيت uvicorn وتشغيل الأمر:
-# uvicorn main:app --reload
-# للتوزيع على Railway، ستحتاج فقط لملف main.py وملف requirements.txt ومتغير البيئة GEMINI_API_KEY
+        raise HTTPException(status_code=500, detail=f"Error generating questions: {str(e)}")
